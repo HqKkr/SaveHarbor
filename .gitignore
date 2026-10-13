@@ -1,0 +1,24 @@
+# Generated applications and build directories
+*.exe
+*.pdb
+*.zip
+bin/
+obj/
+.vs/
+*.user
+*.suo
+
+# Local preview contains machine paths; keep it out of public source history
+preview.png
+
+# Local application data, credentials, and temporary assets
+settings.json
+versions/
+staging/
+restore/
+work/
+.env
+.env.*
+!.env.example
+*.tmp
+*.log
