@@ -8,6 +8,7 @@ using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -57,6 +58,7 @@ namespace SaveHarbor {
   public override string ToString() { return DateTime.Parse(Created).ToLocalTime().ToString("MM-dd HH:mm:ss")+" · "+Device+" · "+Note; }
  }
  public static class Json {
+  public static T Decode<T>(byte[] bytes) { using(var s=new MemoryStream(bytes)) return (T)new DataContractJsonSerializer(typeof(T)).ReadObject(s); }
   public static byte[] Encode<T>(T value) { using(var s=new MemoryStream()) { new DataContractJsonSerializer(typeof(T)).WriteObject(s,value); return s.ToArray(); } }
   public static T Read<T>(string p) { using(var s=File.OpenRead(p)) return (T)new DataContractJsonSerializer(typeof(T)).ReadObject(s); }
   public static void Write<T>(string p,T value) {
@@ -299,6 +301,8 @@ namespace SaveHarbor {
    Publish(new FolderStorage(State.Library),g,s,source);
   }
   public void Publish(IStorageProvider store,Game g,Snapshot s,string source) {
+   if(s.GameId!=g.Id||HashFile(Path.Combine(source,"save.zip"))!=s.ZipHash) throw new InvalidDataException("备份包校验失败或游戏不匹配。");
+   Verify(Path.Combine(source,"save.zip"),s);
    store.Publish(g,s,source);
    g.LastSynced=s.Id; Persist();
   }
@@ -325,18 +329,21 @@ namespace SaveHarbor {
  }
  public class MainWindow : Window {
   Engine engine; ListBox games=new ListBox(), versions=new ListBox(); TextBlock summary=new TextBlock(), status=new TextBlock(); StackPanel paths=new StackPanel(); bool busy;
+  BaiduVault cloudVault; BaiduConfig cloud; TextBlock cloudStatus=new TextBlock(); CancellationTokenSource transfer;
+  Button cancelTransfer=new Button { Content="取消当前操作",Visibility=Visibility.Collapsed,Padding=new Thickness(8),Margin=new Thickness(0,6,0,0) };
   CheckBox autoBackup=new CheckBox { Content="游戏退出后自动备份",Foreground=Ink,Margin=new Thickness(0,8,0,8) }; bool refreshing,exiting;
   System.Windows.Forms.NotifyIcon tray; System.Windows.Threading.DispatcherTimer monitor;
   Dictionary<string,bool> running=new Dictionary<string,bool>(); Dictionary<string,int> pending=new Dictionary<string,int>();
   static Brush Ink=new SolidColorBrush(Color.FromRgb(226,232,240)), Muted=new SolidColorBrush(Color.FromRgb(148,163,184)), PanelColor=new SolidColorBrush(Color.FromRgb(25,34,51));
   public MainWindow(Engine e) {
    engine=e; Title="存档港 · SaveHarbor"; Width=1100; Height=760; MinWidth=920; MinHeight=650; Background=new SolidColorBrush(Color.FromRgb(12,19,32)); Foreground=Ink; FontFamily=new FontFamily("Microsoft YaHei UI"); FontSize=14;
+   cloudVault=new BaiduVault(engine.Data); cloud=cloudVault.Load();
    var root=new DockPanel { Margin=new Thickness(28) }; Content=root;
    var header=new StackPanel { Margin=new Thickness(0,0,0,24) }; header.Children.Add(new TextBlock { Text="存档港",FontSize=30,FontWeight=FontWeights.Bold }); header.Children.Add(new TextBlock { Text="把每一次冒险，留在正确的位置。",Foreground=Muted,Margin=new Thickness(0,8,0,0) }); DockPanel.SetDock(header,Dock.Top); root.Children.Add(header);
-   var foot=new StackPanel { Margin=new Thickness(0,16,0,0) }; status.Text="就绪 · 本地版本 0.1"; status.TextWrapping=TextWrapping.Wrap; foot.Children.Add(status); foot.Children.Add(new TextBlock { Text="百度扫码：尚未接入  ·  文件夹存档库需要外部网盘客户端或共享目录传输",Foreground=Muted,FontSize=12,Margin=new Thickness(0,8,0,0) }); DockPanel.SetDock(foot,Dock.Bottom); root.Children.Add(foot);
+   var foot=new StackPanel { Margin=new Thickness(0,16,0,0) }; status.Text="就绪 · 版本 0.2"; status.TextWrapping=TextWrapping.Wrap; foot.Children.Add(status); cloudStatus.Foreground=Muted; cloudStatus.FontSize=12; cloudStatus.Margin=new Thickness(0,8,0,0); cloudStatus.TextWrapping=TextWrapping.Wrap; foot.Children.Add(cloudStatus); RefreshCloudStatus(); DockPanel.SetDock(foot,Dock.Bottom); root.Children.Add(foot);
    var grid=new Grid(); grid.ColumnDefinitions.Add(new ColumnDefinition { Width=new GridLength(260) }); grid.ColumnDefinitions.Add(new ColumnDefinition()); root.Children.Add(grid);
    var left=new DockPanel { Margin=new Thickness(0,0,24,0) }; grid.Children.Add(left);
-   var tools=new StackPanel(); tools.Children.Add(Button("＋ 添加游戏",AddGame)); tools.Children.Add(Button("设置文件夹存档库",SetLibrary)); tools.Children.Add(Button("从存档库拉取",delegate { Run(async delegate { var n=await Task.Run(()=>engine.Fetch()); Reload(); Say("已导入 "+n+" 个版本；尚未覆盖任何游戏存档。"); }); })); DockPanel.SetDock(tools,Dock.Top); left.Children.Add(tools);
+   var tools=new StackPanel(); tools.Children.Add(Button("＋ 添加游戏",AddGame)); tools.Children.Add(Button("百度网盘配置 / 授权",ConfigureBaidu)); tools.Children.Add(Button("设置文件夹存档库",SetLibrary)); tools.Children.Add(Button("从存档库拉取",delegate { CloudRun(async delegate { var provider=Provider(); var n=await Task.Run(()=>engine.Fetch(provider)); Reload(); Say("已导入 "+n+" 个版本；尚未覆盖任何游戏存档。"); }); })); cancelTransfer.Click+=delegate { if(transfer!=null) transfer.Cancel(); }; tools.Children.Add(cancelTransfer); DockPanel.SetDock(tools,Dock.Top); left.Children.Add(tools);
    games.Background=PanelColor; games.Foreground=Ink; games.BorderThickness=new Thickness(0); games.SelectionChanged+=delegate { Details(); }; left.Children.Add(games);
    var right=new DockPanel(); Grid.SetColumn(right,1); grid.Children.Add(right);
    var top=new StackPanel(); summary.FontSize=18; summary.TextWrapping=TextWrapping.Wrap; summary.Margin=new Thickness(0,0,0,16); top.Children.Add(summary);
@@ -345,7 +352,7 @@ namespace SaveHarbor {
    row.Children.Add(Button("启动游戏",delegate { var g=Selected(); if(!File.Exists(g.Exe)) throw new IOException("请先绑定这台电脑的游戏 EXE。"); Process.Start(new ProcessStartInfo(g.Exe) { WorkingDirectory=Path.GetDirectoryName(g.Exe),UseShellExecute=true }); Say("游戏已启动。若启用自动备份，退出游戏后会创建本地版本。开始前可手动拉取和恢复存档库版本。"); }));
    autoBackup.Click+=delegate { if(refreshing||busy) return; var g=games.SelectedItem as Game; if(g==null) return; if(autoBackup.IsChecked==true&&string.IsNullOrWhiteSpace(g.Exe)) { autoBackup.IsChecked=false; Say("请先设置游戏 EXE。"); return; } g.AutoBackup=autoBackup.IsChecked==true; engine.Persist(); }; top.Children.Add(autoBackup);
    paths.Margin=new Thickness(0,12,0,12); top.Children.Add(paths); DockPanel.SetDock(top,Dock.Top); right.Children.Add(top);
-   var actions=new WrapPanel { Margin=new Thickness(0,12,0,0) }; actions.Children.Add(Button("恢复选中版本",Restore)); actions.Children.Add(Button("发布选中版本到存档库",delegate { Run(async delegate { var g=Selected(); var s=Version(); await Task.Run(()=>engine.Publish(g,s)); Say("版本已发布到文件夹存档库；外部客户端是否上传完成需另行确认。"); }); })); actions.Children.Add(Button("打开本机备份目录",delegate { var g=Selected(); Directory.CreateDirectory(engine.Folder(g.Id)); Process.Start(new ProcessStartInfo(engine.Folder(g.Id)) { UseShellExecute=true }); })); DockPanel.SetDock(actions,Dock.Bottom); right.Children.Add(actions);
+   var actions=new WrapPanel { Margin=new Thickness(0,12,0,0) }; actions.Children.Add(Button("恢复选中版本",Restore)); actions.Children.Add(Button("发布选中版本到存档库",delegate { CloudRun(async delegate { var g=Selected(); var s=Version(); var provider=Provider(); await Task.Run(()=>engine.Publish(provider,g,s,Path.Combine(engine.Folder(g.Id),s.Id))); Say(cloud.Enabled?"百度版本上传完成，清单已提交；其他设备可以拉取。":"版本已发布到文件夹存档库；外部客户端是否上传完成需另行确认。"); }); })); actions.Children.Add(Button("打开本机备份目录",delegate { var g=Selected(); Directory.CreateDirectory(engine.Folder(g.Id)); Process.Start(new ProcessStartInfo(engine.Folder(g.Id)) { UseShellExecute=true }); })); DockPanel.SetDock(actions,Dock.Bottom); right.Children.Add(actions);
    var vpanel=new DockPanel(); var label=new TextBlock { Text="版本时间线  ·  相同内容不代表相同进度分支",Foreground=Muted,Margin=new Thickness(0,0,0,10) }; DockPanel.SetDock(label,Dock.Top); vpanel.Children.Add(label); versions.Background=PanelColor; versions.Foreground=Ink; versions.BorderThickness=new Thickness(0); versions.SelectionChanged+=delegate { var s=versions.SelectedItem as Snapshot; if(s!=null) Say("版本 "+s.Id.Substring(0,8)+" · 父版本 "+(s.Parent.Length>0?s.Parent.Substring(0,8):"无")+" · "+s.Files.Count+" 文件 · "+Size(s.Files.Sum(x=>x.Size))); }; vpanel.Children.Add(versions); right.Children.Add(vpanel);
    Reload();
   }
@@ -379,7 +386,11 @@ namespace SaveHarbor {
   }
   public static string Size(long n) { return n>=1073741824?(n/1073741824d).ToString("0.00")+" GB":n>=1048576?(n/1048576d).ToString("0.00")+" MB":(n/1024d).ToString("0.0")+" KB"; }
   Button Button(string text,RoutedEventHandler action) { var b=new Button { Content=text,Padding=new Thickness(14,9,14,9),Margin=new Thickness(0,0,8,8),Background=new SolidColorBrush(Color.FromRgb(42,57,79)),Foreground=Ink,BorderThickness=new Thickness(0) }; b.Click+=delegate(object sender,RoutedEventArgs args) { if(busy) return; try { action(sender,args); } catch(Exception ex) { Say(ex.Message); } }; return b; }
-  async void Run(Func<Task> action) { if(busy) return; busy=true; ((UIElement)Content).IsEnabled=false; Say("处理中，请稍候…"); try { await action(); } catch(Exception ex) { Say("操作未完成："+ex.Message); } finally { busy=false; ((UIElement)Content).IsEnabled=true; } }
+  async void Run(Func<Task> action) { if(busy) return; busy=true; games.IsEnabled=false; autoBackup.IsEnabled=false; Say("处理中，请稍候…"); try { await action(); } catch(OperationCanceledException) { Say("操作已取消；云端未完成版本不会作为有效存档导入。"); } catch(Exception ex) { Say("操作未完成："+ex.Message); } finally { busy=false; games.IsEnabled=true; autoBackup.IsEnabled=games.SelectedItem!=null; } }
+  void CloudRun(Func<Task> action) { if(busy) return; transfer=new CancellationTokenSource(); cancelTransfer.Visibility=Visibility.Visible; Run(async delegate { try { await action(); } finally { transfer.Dispose(); transfer=null; cancelTransfer.Visibility=Visibility.Collapsed; RefreshCloudStatus(); } }); }
+  IStorageProvider Provider() { if(!cloud.Enabled) return new FolderStorage(engine.State.Library); var ct=transfer==null?CancellationToken.None:transfer.Token; return new BaiduStorage(cloud,new BaiduApi(cloud,cloudVault,null,ct,delegate(string progress) { Dispatcher.BeginInvoke(new Action(delegate { if(busy) Say(progress); })); }),Path.Combine(engine.Data,"baidu-cache")); }
+  void RefreshCloudStatus() { cloudStatus.Text=cloud.Enabled?"存档库：百度网盘 · "+(cloud.AccessToken.Length>0?"已保存授权（可测试连接）":"尚未授权")+" · "+cloud.CloudRoot:"存档库：本地文件夹 · 百度 API 可在配置页启用"; }
+  void ConfigureBaidu(object sender,RoutedEventArgs args) { var dialog=new BaiduSettingsWindow(cloud,cloudVault) { Owner=this }; if(dialog.ShowDialog()==true) { cloud=dialog.Result; RefreshCloudStatus(); Say("百度配置已使用 Windows 当前用户加密保存。"); } else { cloud=cloudVault.Load(); RefreshCloudStatus(); } }
   void Say(string text) { status.Text=text; }
   Game Selected() { var g=games.SelectedItem as Game; if(g==null) throw new InvalidOperationException("请先选择一个游戏。"); return g; }
   Snapshot Version() { var s=versions.SelectedItem as Snapshot; if(s==null) throw new InvalidOperationException("请先选择一个版本。"); return s; }
@@ -419,17 +430,19 @@ namespace SaveHarbor {
  public static class Program {
   [STAThread] public static int Main(string[] args) {
    try {
-    if(args.Length>0&&args[0]=="--self-test") { Tests.Run(args[1]); return 0; }
+    if(args.Length>0&&args[0]=="--self-test") { Tests.Run(args[1]); BaiduTests.Run(args[1]); return 0; }
     var data=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"SaveHarbor");
     if(args.Length>=2&&args[0]=="--data") data=args[1];
-    if(args.Length>=3&&args[0]=="--preview") data=args[2];
+    if(args.Length>=3&&(args[0]=="--preview"||args[0]=="--preview-settings")) data=args[2];
     var app=new Application(); var e=new Engine(data); var window=new MainWindow(e);
-    if(args.Length>=3&&args[0]=="--preview") {
+    if(args.Length>=3&&(args[0]=="--preview"||args[0]=="--preview-settings")) {
      // Preview uses only caller-supplied workspace data, never the real profile.
-     var content=(UIElement)window.Content; window.Content=null; var scene=new Border { Background=window.Background,Child=content };
-     System.Windows.Documents.TextElement.SetForeground(scene,window.Foreground); System.Windows.Documents.TextElement.SetFontFamily(scene,window.FontFamily); System.Windows.Documents.TextElement.SetFontSize(scene,window.FontSize);
-     scene.Measure(new Size(1100,760)); scene.Arrange(new Rect(0,0,1100,760)); scene.UpdateLayout();
-     var bmp=new RenderTargetBitmap(1100,760,96,96,PixelFormats.Pbgra32); bmp.Render(scene); var enc=new PngBitmapEncoder(); enc.Frames.Add(BitmapFrame.Create(bmp)); using(var f=File.Create(args[1])) enc.Save(f); return 0;
+     Window preview=args[0]=="--preview-settings"?(Window)new BaiduSettingsWindow(new BaiduConfig(),new BaiduVault(data)):window;
+     var width=args[0]=="--preview-settings"?760:1100; var height=args[0]=="--preview-settings"?820:760;
+     var content=(UIElement)preview.Content; preview.Content=null; var scene=new Border { Background=preview.Background,Child=content };
+     System.Windows.Documents.TextElement.SetForeground(scene,preview.Foreground); System.Windows.Documents.TextElement.SetFontFamily(scene,preview.FontFamily); System.Windows.Documents.TextElement.SetFontSize(scene,preview.FontSize);
+     scene.Measure(new Size(width,height)); scene.Arrange(new Rect(0,0,width,height)); scene.UpdateLayout();
+     var bmp=new RenderTargetBitmap(width,height,96,96,PixelFormats.Pbgra32); bmp.Render(scene); var enc=new PngBitmapEncoder(); enc.Frames.Add(BitmapFrame.Create(bmp)); using(var f=File.Create(args[1])) enc.Save(f); return 0;
     }
     using(var mutex=new System.Threading.Mutex(false,"Local\\SaveHarbor-"+Engine.Hash(Encoding.UTF8.GetBytes(Path.GetFullPath(data).ToLowerInvariant())))) {
      bool acquired; try { acquired=mutex.WaitOne(0); } catch(System.Threading.AbandonedMutexException) { acquired=true; }
